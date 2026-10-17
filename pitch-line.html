@@ -38,6 +38,7 @@ canvas{position:absolute;inset:0;width:100%;height:100%;display:block;touch-acti
 .pp{width:68px;height:68px;border-radius:50%;background:var(--song);color:#1b1505;display:grid;place-items:center;flex:none}
 .pp svg{width:28px;height:28px;fill:currentColor}
 .pp:disabled{opacity:.35;cursor:default}
+.speed{flex:none;min-width:56px;padding:10px 12px;border-radius:999px;background:var(--panel);border:1px solid var(--line);font-weight:800;font-variant-numeric:tabular-nums}
 .result small{color:var(--muted);font-size:13px;letter-spacing:.08em;text-transform:uppercase}
 .pct{font:800 76px/1 Manrope,sans-serif;color:var(--song);font-variant-numeric:tabular-nums}
 .best{font-weight:800;color:var(--fg)}
@@ -65,6 +66,7 @@ canvas{position:absolute;inset:0;width:100%;height:100%;display:block;touch-acti
     <span class="time" id="tNow">0:00</span>
     <input class="seek" type="range" id="seek" min="0" max="1" step="0.01" value="0" aria-label="Position in song">
     <span class="time" id="tEnd">0:00</span>
+    <button class="speed" id="speed" aria-label="Playback speed">1×</button>
     <button class="pp" id="pp" aria-label="Play" disabled><svg viewBox="0 0 24 24" id="ppIcon"><path d="M7 4.5v15l13-7.5z"/></svg></button>
   </div>
 </div>
@@ -80,13 +82,25 @@ const V = k => getComputedStyle(document.documentElement).getPropertyValue(k).tr
 const C = { bg:V('--panel'), fg:V('--fg'), muted:V('--muted'), song:V('--song'), you:V('--you'), ok:V('--ok') };
 const PLAY = '<path d="M7 4.5v15l13-7.5z"/>', PAUSE = '<path d="M6 4h4.5v16H6zM13.5 4H18v16h-4.5z"/>';
 
-let ctx = null, gain = null, src = null, buf = null, playing = false, startedAt = 0, offsetAt = 0;
+let ctx = null, buf = null, playing = false, offsetAt = 0, rate = 1, mediaUrl = null;
+// playback through the browser's own player: it can slow down while keeping the pitch
+const audio = new Audio(); audio.preload = 'auto'; audio.preservesPitch = true; audio.webkitPreservesPitch = true; audio.mozPreservesPitch = true; audio.volume = 0.85;
 let frames = new Float32Array(0), hop = 0.02, dur = 0, lo = 48, hi = 72;
 let trail = [], micOn = false, analyser = null, micBuf = null, hist = [], you = null, lastSong = null;
 const LAT = 0.1; // mic delay compensation
 
-function ensureCtx(){ if (ctx) return; ctx = new (window.AudioContext||window.webkitAudioContext)(); gain = ctx.createGain(); gain.gain.value = 0.85; gain.connect(ctx.destination); }
-const now = () => playing ? ctx.currentTime - startedAt : offsetAt;
+function ensureCtx(){ if (ctx) return; ctx = new (window.AudioContext||window.webkitAudioContext)(); }
+const now = () => audio.currentTime || 0;
+function wavBlob(b){ // used only when the sound had to be pulled out of a video
+  const ch = Math.min(2, b.numberOfChannels), n = b.length, sr = b.sampleRate, data = new DataView(new ArrayBuffer(44 + n*ch*2));
+  const w = (o, str) => { for (let i = 0; i < str.length; i++) data.setUint8(o+i, str.charCodeAt(i)); };
+  w(0,'RIFF'); data.setUint32(4, 36 + n*ch*2, true); w(8,'WAVE'); w(12,'fmt '); data.setUint32(16,16,true); data.setUint16(20,1,true);
+  data.setUint16(22,ch,true); data.setUint32(24,sr,true); data.setUint32(28,sr*ch*2,true); data.setUint16(32,ch*2,true); data.setUint16(34,16,true);
+  w(36,'data'); data.setUint32(40, n*ch*2, true);
+  const cs = []; for (let c = 0; c < ch; c++) cs.push(b.getChannelData(c));
+  let o = 44; for (let i = 0; i < n; i++) for (let c = 0; c < ch; c++){ const v = Math.max(-1, Math.min(1, cs[c][i])); data.setInt16(o, v < 0 ? v*0x8000 : v*0x7fff, true); o += 2; }
+  return new Blob([data], { type: 'audio/wav' });
+}
 
 // ---------- YIN ----------
 function yin(x, off, W, tmin, tmax, thr, d){
@@ -188,13 +202,14 @@ function extractViaPlayer(file){
 }
 async function load(file){
   if (!file) return;
-  ensureCtx(); ctx.resume(); stop(); offsetAt = 0;
+  ensureCtx(); ctx.resume(); stop(); offsetAt = 0; audio.removeAttribute('src');
   const isVideo = /^video\//.test(file.type) || /\.(mp4|mov|mkv|webm|avi|m4v|3gp)$/i.test(file.name);
   $('empty').hidden = true; busy(isVideo ? 'Taking the sound from the video…' : 'Opening the song…', 0.03);
-  let b = null;
+  let b = null, playable = file;
   try{ b = await ctx.decodeAudioData(await file.arrayBuffer()); }catch(e){}
-  if (!b && isVideo){ try{ b = await extractViaPlayer(file); }catch(e){} }
+  if (!b && isVideo){ try{ b = await extractViaPlayer(file); playable = wavBlob(b); }catch(e){} }
   if (!b){ $('busy').hidden = true; $('empty').hidden = false; $('empty').querySelector('b').textContent = "That file couldn't be opened"; $('empty').querySelector('span').textContent = 'Try an MP3 or an MP4 video.'; return; }
+  if (mediaUrl) URL.revokeObjectURL(mediaUrl); mediaUrl = URL.createObjectURL(playable); audio.src = mediaUrl; audio.load();
   buf = b; env = buildEnv(b); ratios = []; floor = 0; const r = await analyze(b); frames = r.f; hop = r.hop; dur = b.duration; setRange();
   trail = []; $('busy').hidden = true;
   songName = file.name.replace(/\.[^.]+$/, ''); songKey = 'pitchline-best:' + songName + '|' + Math.round(dur);
@@ -216,14 +231,15 @@ async function startMic(){
 }
 async function play(){
   if (!buf) return; ensureCtx(); await ctx.resume(); await startMic();
-  if (offsetAt >= dur - 0.1) offsetAt = 0;
-  if (offsetAt < 0.5){ trail = []; resetScore(); }
+  if (audio.ended || now() >= dur - 0.1) audio.currentTime = 0;
+  if (now() < 0.5){ trail = []; resetScore(); }
   $('result').hidden = true; $('live').hidden = false;
-  src = ctx.createBufferSource(); src.buffer = buf; src.connect(gain); src.start(0, offsetAt);
-  startedAt = ctx.currentTime - offsetAt; playing = true; $('ppIcon').innerHTML = PAUSE; $('pp').setAttribute('aria-label','Pause');
-  src.onended = () => { if (playing && now() >= dur - 0.15){ offsetAt = dur; playing = false; setIcon(); finish(); } };
+  audio.playbackRate = rate;
+  try{ await audio.play(); }catch(e){ return; }
+  playing = true; $('ppIcon').innerHTML = PAUSE; $('pp').setAttribute('aria-label','Pause');
 }
-function stop(){ if (playing){ offsetAt = now(); try{ src.onended = null; src.stop(); }catch(e){} } playing = false; setIcon(); }
+audio.addEventListener('ended', () => { playing = false; setIcon(); finish(); });
+function stop(){ audio.pause(); playing = false; setIcon(); }
 function setIcon(){ $('ppIcon').innerHTML = PLAY; $('pp').setAttribute('aria-label','Play'); }
 const micD = new Float32Array(1200);
 function readMic(){
@@ -236,7 +252,7 @@ function readMic(){
   // then ignore anything that isn't clearly louder than that. Your voice is close to the mic, the speaker's echo is not.
   let bleed = false;
   if (playing){
-    const lvl = songLevel(now()) * gain.gain.value;
+    const lvl = songLevel(now()) * audio.volume;
     if (lvl > 0.01){
       const r = micRms / lvl;
       ratios.push(r); if (ratios.length > 900) ratios.shift();
@@ -331,7 +347,7 @@ function draw(t, songNow){
 
 // ---------- loop ----------
 function tick(){
-  const t = playing ? now() : offsetAt;
+  const t = now();
   const s = songAt(t); if (s !== null) lastSong = s;
   const u = readMic();
   // your line snaps to the song's octave, so any voice can follow any song
@@ -343,10 +359,10 @@ function tick(){
     }
     you = u + 12*(octK || 0);
   }
-  if (playing){ trail.push({ t: t - LAT, m: you }); if (trail.length > 30000) trail.splice(0, 10000); }
+  if (playing){ trail.push({ t: t - LAT*rate, m: you }); if (trail.length > 30000) trail.splice(0, 10000); }
   // score: every moment the song has a voice, compare your pitch (full point within ±50 cents, half within ±100)
   if (playing && micOn){
-    const ref = songAt(t - LAT);
+    const ref = songAt(t - LAT*rate);
     if (ref !== null){ tot++; if (you !== null){ const d = Math.abs(you - ref); hitW += d <= 0.5 ? 1 : d <= 1 ? 0.5 : 0; } }
     $('live').textContent = pct() + '%';
   }
@@ -360,8 +376,10 @@ function tick(){
 // ---------- controls ----------
 $('file').addEventListener('change', e => { load(e.target.files[0]); e.target.value = ''; });
 $('pp').onclick = () => playing ? stop() : play();
-$('again').onclick = () => { offsetAt = 0; play(); };
-$('seek').addEventListener('input', e => { const was = playing; stop(); offsetAt = +e.target.value; trail = trail.filter(p => p.t < offsetAt); if (was) play(); });
+$('again').onclick = () => { audio.currentTime = 0; play(); };
+$('seek').addEventListener('input', e => { const v = +e.target.value; audio.currentTime = v; trail = trail.filter(p => p.t < v); });
+const SPEEDS = [1, 0.75, 0.5];
+$('speed').onclick = () => { rate = SPEEDS[(SPEEDS.indexOf(rate) + 1) % SPEEDS.length]; audio.playbackRate = rate; $('speed').textContent = rate + '×'; };
 document.addEventListener('dragover', e => e.preventDefault());
 document.addEventListener('drop', e => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) load(f); });
 document.addEventListener('keydown', e => { if (e.code === 'Space' && buf){ e.preventDefault(); playing ? stop() : play(); } });
