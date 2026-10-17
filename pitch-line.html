@@ -127,17 +127,17 @@ const median = a => { const s = a.slice().sort((p,q)=>p-q); return s[s.length>>1
 async function analyze(buffer){
   const SR = 16000, off = new OfflineAudioContext(1, Math.max(1, Math.ceil(buffer.duration*SR)), SR);
   const s = off.createBufferSource(); s.buffer = buffer;
-  const hp = off.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 140;
+  const hp = off.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 85;
   const lp = off.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 1100;
   s.connect(hp); hp.connect(lp); lp.connect(off.destination); s.start();
   const x = (await off.startRendering()).getChannelData(0);
-  const W = 512, HOP = 320, tmin = Math.floor(SR/1000), tmax = Math.ceil(SR/75);
+  const W = 512, HOP = 320, tmin = Math.floor(SR/1000), tmax = Math.ceil(SR/62);
   const n = Math.max(0, Math.floor((x.length - W - tmax - 1)/HOP));
   const rms = new Float32Array(n), raw = new Float32Array(n).fill(NaN), d = new Float32Array(tmax+2);
   for (let i = 0; i < n; i++){ let e = 0, o = i*HOP; for (let j = 0; j < W; j++) e += x[o+j]*x[o+j]; rms[i] = Math.sqrt(e/W); }
   const srt = Array.from(rms).sort((a,b)=>a-b), gate = 0.15*(srt[Math.floor(srt.length*.95)]||0);
   for (let i = 0; i < n; i++){
-    if (rms[i] > gate){ const t = yin(x, i*HOP, W, tmin, tmax, 0.18, d); if (t){ const m = toMidi(SR/t); if (m > 40 && m < 86) raw[i] = m; } }
+    if (rms[i] > gate){ const t = yin(x, i*HOP, W, tmin, tmax, 0.18, d); if (t){ const m = toMidi(SR/t); if (m > 36 && m < 86) raw[i] = m; } }
     if (i % 400 === 0){ busy('Reading the song…', 0.1 + 0.9*i/n); await new Promise(r => setTimeout(r)); }
   }
   // smooth, fix octave jumps, drop tiny blips (< 100 ms)
@@ -170,8 +170,8 @@ async function analyze(buffer){
 function setRange(){
   const v = Array.from(frames).filter(x => x === x).sort((a,b)=>a-b);
   if (!v.length){ lo = 48; hi = 72; return; }
-  let a = v[Math.floor(v.length*.03)] - 3, b = v[Math.floor(v.length*.97)] + 3;
-  if (b - a < 15){ const c = (a+b)/2; a = c - 7.5; b = c + 7.5; }
+  let a = v[Math.floor(v.length*.03)] - 5, b = v[Math.floor(v.length*.97)] + 5;
+  if (b - a < 22){ const c = (a+b)/2; a = c - 11; b = c + 11; }
   lo = Math.floor(a); hi = Math.ceil(b);
 }
 
@@ -366,7 +366,11 @@ function tick(){
     if (ref !== null){ tot++; if (you !== null){ const d = Math.abs(you - ref); hitW += d <= 0.5 ? 1 : d <= 1 ? 0.5 : 0; } }
     $('live').textContent = pct() + '%';
   }
-  if (you !== null && (you < lo + 1 || you > hi - 1) && lastSong === null){ lo = Math.floor(you) - 8; hi = lo + 16; }
+  // the scale grows to fit your voice, so low (or high) notes never fall off the screen
+  if (you !== null){
+    if (you < lo + 1.5) lo = Math.max(28, Math.floor(you) - 3);
+    if (you > hi - 1.5) hi = Math.min(96, Math.ceil(you) + 3);
+  }
   if (playing){ $('seek').value = t; }
   $('tNow').textContent = fmt(t);
   draw(t, s);
