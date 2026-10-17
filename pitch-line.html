@@ -1,0 +1,519 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pitch Line</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;700&family=Manrope:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: a stage — one wide piano-roll canvas, a live tuner readout under it, controls in a wrapping strip */
+:root{
+  --bg:#0d0f14; --panel:#151922; --line:#232937; --fg:#eef0f5; --muted:#8a92a6;
+  --target:#f3c14b; --voice:#4fd8e8; --hit:#5ee08a; --miss:#ff6b6b;
+  --display:"Unbounded",system-ui,sans-serif; --body:"Manrope",system-ui,sans-serif; --mono:"JetBrains Mono",ui-monospace,monospace;
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 var(--body)}
+.wrap{max-width:1200px;margin:0 auto;padding:20px 16px 32px;display:flex;flex-direction:column;gap:14px}
+header{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:12px}
+h1{font:700 26px/1 var(--display);margin:0;letter-spacing:-.01em}
+h1 span{color:var(--target)}
+.sub{color:var(--muted);margin:6px 0 0;max-width:62ch;font-size:14px}
+.song{font:600 13px var(--mono);color:var(--muted);text-align:right;min-width:0}
+.song b{color:var(--fg);display:block;font:600 14px var(--body);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:40ch}
+.stage{position:relative;background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+canvas{display:block;width:100%;height:clamp(300px,52vh,560px)}
+.overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:10px;background:rgba(13,15,20,.82);font-weight:600}
+.bar{width:min(320px,70%);height:6px;background:var(--line);border-radius:3px;overflow:hidden}
+.bar i{display:block;height:100%;width:0;background:var(--target)}
+.drop{border:2px dashed var(--target);inset:10px;border-radius:12px;font:700 18px var(--display)}
+.readout{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+.cell{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px 14px;min-width:0}
+.cell small{display:block;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.cell .v{font:700 24px/1.2 var(--display);font-variant-numeric:tabular-nums}
+.t{color:var(--target)} .u{color:var(--voice)}
+.cents{position:relative;height:8px;background:var(--line);border-radius:4px;margin-top:10px}
+.cents::before{content:"";position:absolute;left:calc(50% - 1px);top:-3px;width:2px;height:14px;background:var(--muted)}
+.cents i{position:absolute;top:-2px;width:12px;height:12px;border-radius:50%;background:var(--muted);left:calc(50% - 6px);transition:left .08s}
+.controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+button,.file{font:600 14px var(--body);color:var(--fg);background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:9px 14px;cursor:pointer}
+button:hover,.file:hover{border-color:var(--muted)}
+button:focus-visible,.file:focus-within,input:focus-visible,select:focus-visible{outline:2px solid var(--voice);outline-offset:2px}
+button.primary{background:var(--target);color:#1a1405;border-color:var(--target)}
+button.on{border-color:var(--voice);color:var(--voice)}
+.file input{position:absolute;opacity:0;width:1px;height:1px}
+.file{position:relative}
+.seek{flex:1 1 260px;display:flex;align-items:center;gap:10px;font:12px var(--mono);color:var(--muted);min-width:0}
+.seek input{flex:1;accent-color:var(--target);min-width:0}
+.opts{display:flex;flex-wrap:wrap;gap:14px;align-items:center;color:var(--muted);font-size:13px}
+.opts label{display:flex;align-items:center;gap:6px}
+.opts input[type=range]{width:90px;accent-color:var(--voice)}
+select{font:inherit;color:var(--fg);background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:4px 6px}
+.tip{color:var(--muted);font-size:13px;margin:0}
+.tip b{color:var(--fg)}
+@media (max-width:640px){.readout{grid-template-columns:repeat(2,minmax(0,1fr))}.song{text-align:left}}
+@media (prefers-reduced-motion:reduce){.cents i{transition:none}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Pitch<span>·</span>Line</h1>
+      <p class="sub">Load a song or a video (the app keeps only its sound). The gold bars are the singer's melody; your voice draws the blue line. Keep your line on the bars.</p>
+    </div>
+    <div class="song" id="songInfo"><b id="songName">Demo: Twinkle Twinkle</b><span id="songMeta">—</span></div>
+  </header>
+
+  <div class="stage" id="stage">
+    <canvas id="cv"></canvas>
+    <div class="overlay" id="busy" hidden><div id="busyText">Reading the melody…</div><div class="bar"><i id="busyBar"></i></div></div>
+    <div class="overlay drop" id="dropHint" hidden>Drop the song or video here</div>
+  </div>
+
+  <div class="readout">
+    <div class="cell"><small>Target note</small><div class="v t" id="rTarget">—</div></div>
+    <div class="cell"><small>Your note</small><div class="v u" id="rYou">—</div></div>
+    <div class="cell"><small>Off by (cents)</small><div class="v" id="rCents">—</div><div class="cents"><i id="needle"></i></div></div>
+    <div class="cell"><small>Score</small><div class="v" id="rScore">—</div></div>
+  </div>
+
+  <div class="controls">
+    <label class="file">Load song or video<input type="file" id="file" accept="audio/*,video/*"></label>
+    <button class="primary" id="play">▶ Play</button>
+    <button id="restart">⟲ Restart</button>
+    <button id="mic">🎤 Turn on mic</button>
+    <div class="seek"><span id="tNow">0:00</span><input type="range" id="seek" min="0" max="1" step="0.01" value="0"><span id="tEnd">0:00</span></div>
+  </div>
+
+  <div class="opts">
+    <label><input type="checkbox" id="octFree" checked> Any octave counts</label>
+    <label>Guide octave <select id="shift"><option value="-12">−1</option><option value="0" selected>0</option><option value="12">+1</option></select></label>
+    <label>Tolerance <select id="tol"><option value="0.5">±50¢ (hard)</option><option value="1" selected>±100¢</option><option value="1.5">±150¢ (easy)</option></select></label>
+    <label>Song volume <input type="range" id="vol" min="0" max="1" step="0.05" value="0.8"></label>
+    <label><input type="checkbox" id="guide"> Guide tone</label>
+    <label>Mic delay <input type="range" id="lat" min="0" max="0.4" step="0.01" value="0.08"><span id="latV">80ms</span></label>
+  </div>
+
+  <p class="tip"><b>From YouTube:</b> a web page can't pull audio out of a YouTube link, so download it first as an MP4 video or an MP3 (any YouTube downloader works), then load it here or drag it onto the stage. Use <b>headphones</b> so the mic hears only you.</p>
+</div>
+
+<script>
+(() => {
+const $ = id => document.getElementById(id);
+const cv = $('cv'), g = cv.getContext('2d');
+const NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+const noteName = m => NAMES[((Math.round(m)%12)+12)%12] + (Math.floor(Math.round(m)/12)-1);
+const fmt = s => { s = Math.max(0, s|0); return (s/60|0) + ':' + String(s%60).padStart(2,'0'); };
+const css = k => getComputedStyle(document.documentElement).getPropertyValue(k).trim();
+const C = { bg:css('--panel'), line:css('--line'), fg:css('--fg'), muted:css('--muted'), target:css('--target'), voice:css('--voice'), hit:css('--hit'), miss:css('--miss') };
+
+// ---------- state ----------
+let ctx = null, songGain = null, src = null, buf = null;
+let playing = false, startedAt = 0, offsetAt = 0;
+let song = { frames: new Float32Array(0), hop: 0.02, notes: [], dur: 0, lo: 55, hi: 76 };
+let trail = []; // {t, m (display midi), hit}
+let stats = { hit: 0, total: 0 };
+let micOn = false, analyser = null, micBuf = null, micHist = [], lastUser = null;
+let osc = null, oscGain = null;
+const S = { octFree: true, shift: 0, tol: 1, lat: 0.08 };
+
+function ensureCtx(){
+  if (ctx) return ctx;
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  songGain = ctx.createGain(); songGain.gain.value = +$('vol').value; songGain.connect(ctx.destination);
+  return ctx;
+}
+const now = () => playing ? ctx.currentTime - startedAt : offsetAt;
+
+// ---------- YIN pitch detection ----------
+function yin(x, off, W, tmin, tmax, thr, d){
+  let run = 0; d[0] = 1;
+  for (let tau = 1; tau <= tmax; tau++){
+    let s = 0;
+    for (let j = 0; j < W; j++){ const v = x[off+j] - x[off+j+tau]; s += v*v; }
+    run += s; d[tau] = run > 0 ? s*tau/run : 1;
+  }
+  let tau = tmin;
+  for (; tau <= tmax; tau++){
+    if (d[tau] < thr){ while (tau+1 <= tmax && d[tau+1] < d[tau]) tau++; break; }
+  }
+  if (tau > tmax) return null;
+  let b = tau;
+  if (tau > 1 && tau < tmax){ const a = d[tau-1], c = d[tau+1], m = d[tau], den = a + c - 2*m; if (den) b = tau + (a - c)/(2*den); }
+  return b;
+}
+const toMidi = f => 69 + 12*Math.log2(f/440);
+const median = a => { const s = a.slice().sort((p,q)=>p-q); return s[s.length>>1]; };
+
+// ---------- song analysis ----------
+async function analyze(buffer){
+  showBusy('Reading the melody…', 0);
+  const SR = 16000, len = Math.max(1, Math.ceil(buffer.duration*SR));
+  const off = new OfflineAudioContext(1, len, SR);
+  const s = off.createBufferSource(); s.buffer = buffer;
+  // stereo → mono keeps the centre (where the lead vocal usually sits); band-pass to the voice range
+  const hp = off.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 140;
+  const lp = off.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 1100;
+  s.connect(hp); hp.connect(lp); lp.connect(off.destination); s.start();
+  const x = (await off.startRendering()).getChannelData(0);
+
+  const W = 512, HOP = 320, tmin = Math.floor(SR/1000), tmax = Math.ceil(SR/75);
+  const n = Math.max(0, Math.floor((x.length - W - tmax - 1)/HOP));
+  const rms = new Float32Array(n), raw = new Float32Array(n).fill(NaN), d = new Float32Array(tmax+2);
+  for (let i = 0; i < n; i++){ let e = 0, o = i*HOP; for (let j = 0; j < W; j++) e += x[o+j]*x[o+j]; rms[i] = Math.sqrt(e/W); }
+  const sorted = Array.from(rms).sort((a,b)=>a-b);
+  const gate = 0.15 * (sorted[Math.floor(sorted.length*0.95)] || 0);
+
+  for (let i = 0; i < n; i++){
+    if (rms[i] > gate){
+      const tau = yin(x, i*HOP, W, tmin, tmax, 0.18, d);
+      if (tau){ const m = toMidi(SR/tau); if (m > 40 && m < 86) raw[i] = m; }
+    }
+    if (i % 400 === 0){ showBusy('Reading the melody…', i/n); await new Promise(r => setTimeout(r)); }
+  }
+  // median smooth + octave-jump repair
+  const sm = new Float32Array(n).fill(NaN);
+  for (let i = 0; i < n; i++){
+    if (isNaN(raw[i])) continue;
+    const w = []; for (let k = -2; k <= 2; k++){ const v = raw[i+k]; if (v === v && v !== undefined) w.push(v); }
+    if (w.length >= 3) sm[i] = median(w);
+  }
+  for (let i = 1; i < n; i++){
+    const p = sm[i-1], v = sm[i];
+    if (p === p && v === v){ if (v - p > 9) sm[i] -= 12; else if (p - v > 9) sm[i] += 12; }
+  }
+  // group into notes
+  const hop = HOP/SR, notes = [];
+  let st = -1, vals = [];
+  const close = end => {
+    if (st >= 0 && (end - st)*hop >= 0.1) notes.push({ t0: st*hop, t1: end*hop, m: Math.round(median(vals)), hit: 0, tot: 0 });
+    st = -1; vals = [];
+  };
+  for (let i = 0; i < n; i++){
+    const v = sm[i];
+    if (v !== v){ close(i); continue; }
+    if (st < 0){ st = i; vals = [v]; continue; }
+    if (Math.abs(v - median(vals)) <= 0.7) vals.push(v); else { close(i); st = i; vals = [v]; }
+  }
+  close(n);
+  const merged = [];
+  for (const nt of notes){
+    const p = merged[merged.length-1];
+    if (p && p.m === nt.m && nt.t0 - p.t1 < 0.07) p.t1 = nt.t1; else merged.push(nt);
+  }
+  hideBusy();
+  return { frames: sm, hop, notes: merged, dur: buffer.duration };
+}
+
+function setRange(){
+  const ms = song.notes.map(n => n.m + S.shift);
+  let lo = ms.length ? Math.min(...ms) : 55, hi = ms.length ? Math.max(...ms) : 76;
+  // ignore outliers: use 3rd/97th percentile
+  if (ms.length > 20){ const s = ms.slice().sort((a,b)=>a-b); lo = s[Math.floor(s.length*.03)]; hi = s[Math.floor(s.length*.97)]; }
+  lo -= 3; hi += 3;
+  if (hi - lo < 16){ const c = (hi+lo)/2; lo = c - 8; hi = c + 8; }
+  song.lo = Math.floor(lo); song.hi = Math.ceil(hi);
+}
+
+async function loadBuffer(buffer, name){
+  stop(); offsetAt = 0;
+  buf = buffer;
+  const res = await analyze(buffer);
+  song = Object.assign(song, res);
+  setRange(); resetStats();
+  $('songName').textContent = name;
+  const first = song.notes[0];
+  $('songMeta').textContent = song.notes.length
+    ? `${song.notes.length} notes · ${noteName(song.lo+3)}–${noteName(song.hi-3)} · voice starts ${fmt(first.t0)}`
+    : 'No clear melody found';
+  $('seek').max = song.dur; $('tEnd').textContent = fmt(song.dur);
+}
+
+// ---------- demo song (public-domain melody, synthesized) ----------
+function demoBuffer(){
+  const SR = 22050, q = 0.55, lead = 2.0;
+  const mel = [60,60,67,67,69,69,[67,2],65,65,64,64,62,62,[60,2],67,67,65,65,64,64,[62,2],67,67,65,65,64,64,[62,2],60,60,67,67,69,69,[67,2],65,65,64,64,62,62,[60,2]];
+  const total = lead + mel.reduce((a,v)=>a+(Array.isArray(v)?v[1]:1),0)*q + 1.5;
+  const b = new AudioBuffer({ length: Math.ceil(total*SR), sampleRate: SR, numberOfChannels: 1 });
+  const y = b.getChannelData(0);
+  let t = lead;
+  for (const v of mel){
+    const m = Array.isArray(v) ? v[0] : v, len = (Array.isArray(v) ? v[1] : 1)*q - 0.06;
+    const f = 440*Math.pow(2,(m-69)/12), i0 = Math.floor(t*SR), N = Math.floor(len*SR);
+    let ph = 0;
+    for (let i = 0; i < N; i++){
+      const tt = i/SR, vib = 1 + 0.004*Math.sin(2*Math.PI*5.5*tt);
+      ph += 2*Math.PI*f*vib/SR;
+      const env = Math.min(1, tt/0.03) * Math.min(1, (len-tt)/0.06);
+      y[i0+i] += 0.22*env*(Math.sin(ph) + 0.5*Math.sin(2*ph) + 0.3*Math.sin(3*ph) + 0.12*Math.sin(4*ph));
+    }
+    t += (Array.isArray(v) ? v[1] : 1)*q;
+  }
+  return b;
+}
+
+// ---------- transport ----------
+function play(){
+  if (!buf) return;
+  ensureCtx(); ctx.resume();
+  if (offsetAt >= buf.duration - 0.05){ offsetAt = 0; resetStats(); }
+  src = ctx.createBufferSource(); src.buffer = buf; src.connect(songGain);
+  src.start(0, offsetAt); startedAt = ctx.currentTime - offsetAt; playing = true;
+  src.onended = () => { if (playing && now() >= buf.duration - 0.1){ offsetAt = buf.duration; playing = false; syncButtons(); } };
+  syncButtons();
+}
+function stop(){
+  if (playing){ offsetAt = now(); try{ src.onended = null; src.stop(); }catch(e){} }
+  playing = false; syncButtons();
+}
+function seek(t){ const was = playing; stop(); offsetAt = Math.max(0, Math.min(t, song.dur)); trail = trail.filter(p => p.t < offsetAt); if (was) play(); }
+function resetStats(){ stats = { hit: 0, total: 0 }; trail = []; song.notes.forEach(n => { n.hit = 0; n.tot = 0; }); }
+function syncButtons(){ $('play').textContent = playing ? '❚❚ Pause' : '▶ Play'; }
+
+// ---------- mic ----------
+async function toggleMic(){
+  if (micOn){ micOn = false; $('mic').classList.remove('on'); $('mic').textContent = '🎤 Turn on mic'; lastUser = null; return; }
+  ensureCtx(); ctx.resume();
+  try{
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false } });
+    const s = ctx.createMediaStreamSource(stream);
+    analyser = ctx.createAnalyser(); analyser.fftSize = 2048; s.connect(analyser);
+    micBuf = new Float32Array(analyser.fftSize);
+    micOn = true; $('mic').classList.add('on'); $('mic').textContent = '🎤 Mic on';
+  }catch(e){
+    $('mic').textContent = '🎤 Mic blocked — allow it in the browser bar';
+  }
+}
+const micD = new Float32Array(1400);
+function readMic(){
+  if (!micOn) return null;
+  analyser.getFloatTimeDomainData(micBuf);
+  let e = 0; for (let i = 0; i < 1024; i++) e += micBuf[i]*micBuf[i];
+  if (Math.sqrt(e/1024) < 0.012){ micHist = []; return null; }
+  const sr = ctx.sampleRate, tmax = Math.min(Math.ceil(sr/70), micBuf.length - 1025);
+  const tau = yin(micBuf, 0, 1024, Math.floor(sr/1100), tmax, 0.15, micD);
+  if (!tau){ micHist = []; return null; }
+  const m = toMidi(sr/tau);
+  micHist.push(m); if (micHist.length > 3) micHist.shift();
+  return median(micHist);
+}
+
+// ---------- guide tone ----------
+function setGuide(on){
+  ensureCtx();
+  if (on && !osc){
+    osc = ctx.createOscillator(); osc.type = 'triangle'; oscGain = ctx.createGain(); oscGain.gain.value = 0;
+    osc.connect(oscGain); oscGain.connect(ctx.destination); osc.start();
+  }
+  if (!on && oscGain) oscGain.gain.setTargetAtTime(0, ctx.currentTime, 0.02);
+}
+
+// ---------- helpers ----------
+function noteAt(t){
+  const a = song.notes; let lo = 0, hi = a.length - 1;
+  while (lo <= hi){ const mid = (lo+hi)>>1; if (a[mid].t1 < t) lo = mid+1; else if (a[mid].t0 > t) hi = mid-1; else return a[mid]; }
+  return null;
+}
+function firstIdx(t){ const a = song.notes; let lo = 0, hi = a.length; while (lo < hi){ const mid = (lo+hi)>>1; if (a[mid].t1 < t) lo = mid+1; else hi = mid; } return lo; }
+let lastTargetM = null;
+
+// ---------- render ----------
+let Wd = 0, Ht = 0, dpr = 1;
+function resize(){
+  dpr = window.devicePixelRatio || 1; const r = cv.getBoundingClientRect();
+  Wd = r.width; Ht = r.height; cv.width = Math.round(Wd*dpr); cv.height = Math.round(Ht*dpr);
+  g.setTransform(dpr,0,0,dpr,0,0);
+}
+const GUT = 46;
+function draw(t){
+  const pps = Wd < 600 ? 110 : 170, px = GUT + (Wd - GUT)*0.3;
+  const lo = song.lo, hi = song.hi, pad = 14, rowH = (Ht - pad*2)/(hi - lo);
+  const Y = m => Ht - pad - (m - lo)*rowH, X = tt => px + (tt - t)*pps;
+  g.fillStyle = C.bg; g.fillRect(0,0,Wd,Ht);
+  // rows
+  g.font = '10px "JetBrains Mono", monospace'; g.textBaseline = 'middle';
+  for (let m = lo; m <= hi; m++){
+    const black = [1,3,6,8,10].includes(((m%12)+12)%12);
+    if (black){ g.fillStyle = 'rgba(255,255,255,0.025)'; g.fillRect(GUT, Y(m)-rowH/2, Wd-GUT, rowH); }
+    g.strokeStyle = m % 12 === 0 ? 'rgba(255,255,255,0.12)' : 'rgba(255,255,255,0.04)';
+    g.beginPath(); g.moveTo(GUT, Y(m)+rowH/2); g.lineTo(Wd, Y(m)+rowH/2); g.stroke();
+    if (!black && rowH > 7 || m % 12 === 0){ g.fillStyle = m % 12 === 0 ? C.fg : C.muted; g.fillText(noteName(m), 6, Y(m)); }
+  }
+  g.fillStyle = C.line; g.fillRect(GUT-1, 0, 1, Ht);
+  // raw contour
+  const sh = S.shift, f = song.frames, hop = song.hop;
+  const i0 = Math.max(0, Math.floor((t - (px-GUT)/pps)/hop)), i1 = Math.min(f.length, Math.ceil((t + (Wd-px)/pps)/hop));
+  g.strokeStyle = 'rgba(243,193,75,0.35)'; g.lineWidth = 1.5; g.beginPath(); let pen = false;
+  for (let i = i0; i < i1; i++){ const v = f[i]; if (v !== v){ pen = false; continue; } const xx = X(i*hop), yy = Y(v+sh); pen ? g.lineTo(xx,yy) : g.moveTo(xx,yy); pen = true; }
+  g.stroke();
+  // notes
+  const a = song.notes;
+  for (let k = firstIdx(t - (px-GUT)/pps); k < a.length && a[k].t0 < t + (Wd-px)/pps; k++){
+    const n = a[k], x0 = Math.max(GUT, X(n.t0)), x1 = X(n.t1); if (x1 < GUT) continue;
+    const yy = Y(n.m + sh), h = Math.max(4, rowH*0.72);
+    let col = C.target, alpha = 1;
+    if (n.t1 < t && n.tot > 4){ col = n.hit/n.tot > 0.5 ? C.hit : C.miss; alpha = 0.55; }
+    const active = n.t0 <= t && n.t1 >= t;
+    g.globalAlpha = alpha; g.fillStyle = col;
+    if (active){ g.shadowColor = col; g.shadowBlur = 16; }
+    roundRect(x0, yy - h/2, Math.max(3, x1 - x0), h, Math.min(6, h/2)); g.fill();
+    g.shadowBlur = 0; g.globalAlpha = 1;
+  }
+  // user trail
+  g.lineWidth = 3; g.lineCap = 'round';
+  for (let k = 1; k < trail.length; k++){
+    const p = trail[k-1], q = trail[k]; if (q.t - p.t > 0.12) continue;
+    const xa = X(p.t), xb = X(q.t); if (xb < GUT) continue;
+    g.strokeStyle = q.hit === null ? C.voice : q.hit ? C.hit : C.miss;
+    g.beginPath(); g.moveTo(xa, Y(p.m)); g.lineTo(xb, Y(q.m)); g.stroke();
+  }
+  // playhead
+  g.strokeStyle = 'rgba(255,255,255,0.5)'; g.lineWidth = 1.5; g.beginPath(); g.moveTo(px,0); g.lineTo(px,Ht); g.stroke();
+  if (lastUser !== null){ g.fillStyle = C.voice; g.beginPath(); g.arc(px, Y(lastUser), 6, 0, Math.PI*2); g.fill(); }
+  // countdown to vocals
+  const nx = a[firstIdx(t)];
+  if (nx && nx.t0 - t > 3){
+    g.fillStyle = C.muted; g.font = '600 14px Manrope, sans-serif'; g.textAlign = 'center';
+    g.fillText(`Voice comes in at ${fmt(nx.t0)} (${Math.ceil(nx.t0 - t)}s)`, (px + Wd)/2, Ht/2); g.textAlign = 'left';
+  }
+  if (!a.length){ g.fillStyle = C.muted; g.font = '600 14px Manrope, sans-serif'; g.textAlign='center'; g.fillText('No clear melody found in this file', Wd/2, Ht/2); g.textAlign='left'; }
+}
+function roundRect(x,y,w,h,r){ g.beginPath(); g.moveTo(x+r,y); g.arcTo(x+w,y,x+w,y+h,r); g.arcTo(x+w,y+h,x,y+h,r); g.arcTo(x,y+h,x,y,r); g.arcTo(x,y,x+w,y,r); g.closePath(); }
+
+// ---------- main loop ----------
+function tick(){
+  const t = playing ? now() : offsetAt;
+  const target = noteAt(t), tm = target ? target.m + S.shift : null;
+  if (tm !== null) lastTargetM = tm;
+  let u = readMic(), shown = null, hit = null, diff = null;
+  if (u !== null){
+    shown = u;
+    const ref = tm !== null ? tm : lastTargetM;
+    if (S.octFree && ref !== null) shown = u + 12*Math.round((ref - u)/12);
+    if (tm !== null){ diff = shown - tm; hit = Math.abs(diff) <= S.tol; }
+    if (playing) trail.push({ t: t - S.lat, m: shown, hit });
+    if (trail.length > 20000) trail.splice(0, 5000);
+  }
+  lastUser = shown;
+  if (playing && target && micOn){
+    stats.total++; target.tot++;
+    if (hit){ stats.hit++; target.hit++; }
+  }
+  // guide tone
+  if (oscGain && $('guide').checked){
+    if (tm !== null && playing){ osc.frequency.setTargetAtTime(440*Math.pow(2,(tm-69)/12), ctx.currentTime, 0.01); oscGain.gain.setTargetAtTime(0.12, ctx.currentTime, 0.02); }
+    else oscGain.gain.setTargetAtTime(0, ctx.currentTime, 0.03);
+  }
+  // readouts
+  $('rTarget').textContent = tm !== null ? noteName(tm) : '—';
+  $('rYou').textContent = shown !== null ? noteName(shown) : (micOn ? '…' : 'mic off');
+  if (diff !== null){
+    const c = Math.round(diff*100), cl = Math.max(-200, Math.min(200, c));
+    $('rCents').textContent = (c > 0 ? '+' : '') + c;
+    const nd = $('needle'); nd.style.left = `calc(${50 + cl/4}% - 6px)`; nd.style.background = hit ? C.hit : C.miss;
+  } else { $('rCents').textContent = '—'; $('needle').style.left = 'calc(50% - 6px)'; $('needle').style.background = C.muted; }
+  $('rScore').textContent = stats.total > 10 ? Math.round(100*stats.hit/stats.total) + '%' : '—';
+  if (playing){ $('seek').value = t; }
+  $('tNow').textContent = fmt(t);
+  draw(t);
+  requestAnimationFrame(tick);
+}
+
+// ---------- UI ----------
+function showBusy(txt, p){ $('busy').hidden = false; $('busyText').textContent = txt; $('busyBar').style.width = Math.round(p*100) + '%'; }
+function hideBusy(){ $('busy').hidden = true; }
+// Fallback for videos the decoder can't open directly (some MOV/MKV/AVI):
+// play the video silently at 2x through Web Audio and record its soundtrack.
+function extractViaPlayer(file){
+  return new Promise((resolve, reject) => {
+    const RATE = 2, url = URL.createObjectURL(file);
+    const v = document.createElement('video');
+    v.preload = 'auto'; v.src = url; v.playsInline = true;
+    v.preservesPitch = false; v.mozPreservesPitch = false; v.webkitPreservesPitch = false;
+    const L = [], R = [];
+    let node, sp, sink, done = false;
+    const finish = err => {
+      if (done) return; done = true;
+      try{ v.pause(); sp.disconnect(); node.disconnect(); }catch(e){}
+      URL.revokeObjectURL(url);
+      if (err) return reject(err);
+      const n = L.reduce((a, c) => a + c.length, 0);
+      if (!n) return reject(new Error('no audio'));
+      const out = new AudioBuffer({ length: n, sampleRate: ctx.sampleRate / RATE, numberOfChannels: 2 });
+      const a = out.getChannelData(0), b = out.getChannelData(1);
+      let o = 0; for (let k = 0; k < L.length; k++){ a.set(L[k], o); b.set(R[k], o); o += L[k].length; }
+      resolve(out);
+    };
+    v.onerror = () => finish(new Error('unreadable'));
+    v.onloadedmetadata = async () => {
+      try{
+        node = ctx.createMediaElementSource(v);
+        sp = ctx.createScriptProcessor(4096, 2, 2);
+        sink = ctx.createGain(); sink.gain.value = 0;
+        node.connect(sp); sp.connect(sink); sink.connect(ctx.destination);
+        sp.onaudioprocess = e => {
+          if (v.paused || v.ended) return;
+          const ib = e.inputBuffer;
+          L.push(new Float32Array(ib.getChannelData(0)));
+          R.push(new Float32Array(ib.getChannelData(ib.numberOfChannels > 1 ? 1 : 0)));
+          if (isFinite(v.duration)) showBusy('Extracting audio from video…', v.currentTime / v.duration);
+        };
+        v.onended = () => finish();
+        await ctx.resume();
+        v.playbackRate = RATE;
+        await v.play();
+      }catch(e){ finish(e); }
+    };
+  });
+}
+
+async function loadFile(file){
+  if (!file) return;
+  ensureCtx(); ctx.resume();
+  const isVideo = /^video\//.test(file.type) || /\.(mp4|mov|mkv|webm|avi|m4v|3gp)$/i.test(file.name);
+  const name = file.name.replace(/\.[^.]+$/, '');
+  showBusy((isVideo ? 'Extracting audio from ' : 'Opening ') + file.name + '…', 0);
+  let b = null;
+  try{
+    const ab = await file.arrayBuffer();
+    b = await ctx.decodeAudioData(ab);
+  }catch(e){ b = null; }
+  if (!b && isVideo){
+    try{ b = await extractViaPlayer(file); }catch(e){ b = null; }
+  }
+  if (!b){
+    hideBusy();
+    $('songMeta').textContent = isVideo ? 'This video has no audio the browser can read. Try an MP4.' : 'This file could not be read. Try an MP3 or M4A.';
+    return;
+  }
+  await loadBuffer(b, name);
+  if (isVideo) $('songMeta').textContent = 'Audio from video · ' + $('songMeta').textContent;
+}
+$('file').addEventListener('change', e => loadFile(e.target.files[0]));
+const stage = $('stage');
+['dragenter','dragover'].forEach(ev => document.addEventListener(ev, e => { e.preventDefault(); $('dropHint').hidden = false; }));
+['dragleave','drop'].forEach(ev => document.addEventListener(ev, e => { e.preventDefault(); if (ev === 'drop' || !e.relatedTarget) $('dropHint').hidden = true; }));
+document.addEventListener('drop', e => { const f = e.dataTransfer.files[0]; if (f) loadFile(f); });
+$('play').onclick = () => playing ? stop() : play();
+$('restart').onclick = () => { stop(); offsetAt = 0; resetStats(); play(); };
+$('mic').onclick = toggleMic;
+$('seek').addEventListener('input', e => seek(+e.target.value));
+$('vol').addEventListener('input', e => { ensureCtx(); songGain.gain.value = +e.target.value; });
+$('octFree').onchange = e => S.octFree = e.target.checked;
+$('shift').onchange = e => { S.shift = +e.target.value; setRange(); trail = []; };
+$('tol').onchange = e => S.tol = +e.target.value;
+$('lat').addEventListener('input', e => { S.lat = +e.target.value; $('latV').textContent = Math.round(S.lat*1000) + 'ms'; });
+$('guide').onchange = e => setGuide(e.target.checked);
+document.addEventListener('keydown', e => { if (e.code === 'Space' && e.target.tagName !== 'INPUT'){ e.preventDefault(); playing ? stop() : play(); } });
+window.addEventListener('resize', resize);
+
+resize();
+loadBuffer(demoBuffer(), 'Demo: Twinkle Twinkle').then(() => { offsetAt = 1.4; $('seek').value = offsetAt; });
+requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
