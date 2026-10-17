@@ -113,8 +113,28 @@ async function analyze(buffer){
   const sm = new Float32Array(n).fill(NaN);
   for (let i = 0; i < n; i++){ if (raw[i] !== raw[i]) continue; const w = []; for (let k = -2; k <= 2; k++){ const v = raw[i+k]; if (v !== undefined && v === v) w.push(v); } if (w.length >= 3) sm[i] = median(w); }
   for (let i = 1; i < n; i++){ const p = sm[i-1], v = sm[i]; if (p === p && v === v){ if (v-p > 9) sm[i] -= 12; else if (p-v > 9) sm[i] += 12; } }
-  for (let i = 0; i < n;){ if (sm[i] !== sm[i]){ i++; continue; } let j = i; while (j < n && sm[j] === sm[j]) j++; if ((j-i)*HOP/SR < 0.1) for (let k = i; k < j; k++) sm[k] = NaN; i = j; }
-  return { f: sm, hop: HOP/SR };
+  // steady the line: split into held notes and flatten each one to its middle pitch
+  const out = new Float32Array(n).fill(NaN), minLen = Math.round(0.12*SR/HOP);
+  let st = -1, vals = [];
+  const close = end => { if (st >= 0 && end - st >= minLen){ const m = median(vals); for (let k = st; k < end; k++) out[k] = m; } st = -1; vals = []; };
+  for (let i = 0; i < n; i++){
+    const v = sm[i];
+    if (v !== v){ // bridge 1–2 frame dropouts inside a note
+      if (st >= 0 && i+2 < n && (sm[i+1] === sm[i+1] || sm[i+2] === sm[i+2])) continue;
+      close(i); continue;
+    }
+    if (st < 0){ st = i; vals = [v]; continue; }
+    if (Math.abs(v - median(vals)) <= 0.8) vals.push(v); else { close(i); st = i; vals = [v]; }
+  }
+  close(n);
+  // join notes that are close together with a short slide
+  for (let i = 1; i < n; i++){
+    if (out[i] === out[i] || out[i-1] !== out[i-1]) continue;
+    let j = i; while (j < n && out[j] !== out[j]) j++;
+    if (j < n && j - i <= 4){ const a = out[i-1], b = out[j]; for (let k = i; k < j; k++) out[k] = a + (b-a)*(k-i+1)/(j-i+1); }
+    i = j;
+  }
+  return { f: out, hop: HOP/SR };
 }
 function setRange(){
   const v = Array.from(frames).filter(x => x === x).sort((a,b)=>a-b);
@@ -186,11 +206,20 @@ function readMic(){
   if (!micOn) return null;
   analyser.getFloatTimeDomainData(micBuf);
   let e = 0; for (let i = 0; i < 1024; i++) e += micBuf[i]*micBuf[i];
-  if (Math.sqrt(e/1024) < 0.012){ hist = []; return null; }
-  const sr = ctx.sampleRate, t = yin(micBuf, 0, 1024, Math.floor(sr/1100), Math.min(Math.ceil(sr/70), 1023), 0.15, micD);
-  if (!t){ hist = []; return null; }
-  hist.push(toMidi(sr/t)); if (hist.length > 3) hist.shift(); return median(hist);
+  const sr = ctx.sampleRate;
+  const t = Math.sqrt(e/1024) < 0.012 ? null : yin(micBuf, 0, 1024, Math.floor(sr/1100), Math.min(Math.ceil(sr/70), 1023), 0.15, micD);
+  if (!t){ // hold the last pitch through short gaps (~120 ms) so the line doesn't break up
+    if (++miss > 7){ hist = []; smooth = null; }
+    return smooth;
+  }
+  miss = 0;
+  hist.push(toMidi(sr/t)); if (hist.length > 7) hist.shift();
+  const m = median(hist);
+  if (smooth === null || Math.abs(m - smooth) > 2.5) smooth = m;   // real jump to a new note: follow at once
+  else smooth += (m - smooth) * 0.18;                               // small wobble: glide
+  return smooth;
 }
+let miss = 0, smooth = null, octK = null;
 const songAt = t => { const i = Math.round(t/hop); const v = frames[i]; return v === v && v !== undefined ? v : null; };
 
 // ---------- drawing ----------
@@ -239,7 +268,14 @@ function tick(){
   const s = songAt(t); if (s !== null) lastSong = s;
   const u = readMic();
   // your line snaps to the song's octave, so any voice can follow any song
-  you = u === null ? null : (lastSong !== null ? u + 12*Math.round((lastSong - u)/12) : u);
+  if (u === null) you = null;
+  else {
+    if (lastSong !== null){
+      const k = Math.round((lastSong - u)/12);
+      if (octK === null || Math.abs(u + 12*octK - lastSong) > 8) octK = k; // only change octave when clearly needed
+    }
+    you = u + 12*(octK || 0);
+  }
   if (playing){ trail.push({ t: t - LAT, m: you }); if (trail.length > 30000) trail.splice(0, 10000); }
   if (you !== null && (you < lo + 1 || you > hi - 1) && lastSong === null){ lo = Math.floor(you) - 8; hi = lo + 16; }
   if (playing){ $('seek').value = t; }
