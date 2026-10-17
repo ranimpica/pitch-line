@@ -49,7 +49,7 @@ canvas{position:absolute;inset:0;width:100%;height:100%;display:block;touch-acti
 
   <div class="stage">
     <canvas id="cv"></canvas>
-    <div class="msg" id="empty"><b>Add a song or video</b><span>MP3 or MP4. Then press play and sing so the blue line follows the yellow one.</span></div>
+    <div class="msg" id="empty"><b>Add a song or video</b><span>MP3 or MP4. Then press play and sing so the blue line follows the yellow one. Best with headphones.</span></div>
     <div class="msg" id="busy" hidden><b id="busyT">Reading the song…</b><div class="bar"><i id="busyB"></i></div></div>
   </div>
 
@@ -178,7 +178,7 @@ async function load(file){
   try{ b = await ctx.decodeAudioData(await file.arrayBuffer()); }catch(e){}
   if (!b && isVideo){ try{ b = await extractViaPlayer(file); }catch(e){} }
   if (!b){ $('busy').hidden = true; $('empty').hidden = false; $('empty').querySelector('b').textContent = "That file couldn't be opened"; $('empty').querySelector('span').textContent = 'Try an MP3 or an MP4 video.'; return; }
-  buf = b; const r = await analyze(b); frames = r.f; hop = r.hop; dur = b.duration; setRange();
+  buf = b; env = buildEnv(b); ratios = []; floor = 0; const r = await analyze(b); frames = r.f; hop = r.hop; dur = b.duration; setRange();
   trail = []; $('busy').hidden = true;
   $('name').textContent = file.name.replace(/\.[^.]+$/, '');
   $('seek').max = dur; $('seek').value = 0; $('tEnd').textContent = fmt(dur); $('pp').disabled = false;
@@ -206,8 +206,22 @@ function readMic(){
   if (!micOn) return null;
   analyser.getFloatTimeDomainData(micBuf);
   let e = 0; for (let i = 0; i < 1024; i++) e += micBuf[i]*micBuf[i];
-  const sr = ctx.sampleRate;
-  const t = Math.sqrt(e/1024) < 0.012 ? null : yin(micBuf, 0, 1024, Math.floor(sr/1100), Math.min(Math.ceil(sr/70), 1023), 0.15, micD);
+  const sr = ctx.sampleRate, micRms = Math.sqrt(e/1024);
+  // Speaker filter: learn how loud the song itself sounds in the mic (the quiet moments when you're not singing),
+  // then ignore anything that isn't clearly louder than that. Your voice is close to the mic, the speaker's echo is not.
+  let bleed = false;
+  if (playing){
+    const lvl = songLevel(now()) * gain.gain.value;
+    if (lvl > 0.01){
+      const r = micRms / lvl;
+      ratios.push(r); if (ratios.length > 900) ratios.shift();
+      if (ratios.length > 60){
+        if (!(fc++ % 30)){ const s = ratios.slice().sort((a,b)=>a-b); floor = s[Math.floor(s.length*0.1)]; }
+        if (r < floor * 3) bleed = true;
+      }
+    }
+  }
+  const t = (micRms < 0.012 || bleed) ? null : yin(micBuf, 0, 1024, Math.floor(sr/1100), Math.min(Math.ceil(sr/70), 1023), 0.15, micD);
   if (!t){ // hold the last pitch through short gaps (~120 ms) so the line doesn't break up
     if (++miss > 7){ hist = []; smooth = null; }
     return smooth;
@@ -219,7 +233,19 @@ function readMic(){
   else smooth += (m - smooth) * 0.18;                               // small wobble: glide
   return smooth;
 }
-let miss = 0, smooth = null, octK = null;
+let miss = 0, smooth = null, octK = null, ratios = [], floor = 0, fc = 0, env = new Float32Array(0);
+const ENV_HOP = 0.02;
+function buildEnv(b){ // loudness of the song every 20 ms
+  const sr = b.sampleRate, step = Math.round(sr*ENV_HOP), n = Math.floor(b.length/step), out = new Float32Array(n);
+  const chs = []; for (let c = 0; c < b.numberOfChannels; c++) chs.push(b.getChannelData(c));
+  for (let i = 0; i < n; i++){ let e = 0; const o = i*step; for (let j = 0; j < step; j += 4){ let v = 0; for (const ch of chs) v += ch[o+j]; v /= chs.length; e += v*v; } out[i] = Math.sqrt(e/(step/4)); }
+  return out;
+}
+function songLevel(t){ // loudest point of the last 150 ms (covers speaker + mic delay)
+  const i1 = Math.floor(t/ENV_HOP), i0 = Math.max(0, i1 - 8); let m = 0;
+  for (let i = i0; i <= i1 && i < env.length; i++) if (env[i] > m) m = env[i];
+  return m;
+}
 const songAt = t => { const i = Math.round(t/hop); const v = frames[i]; return v === v && v !== undefined ? v : null; };
 
 // ---------- drawing ----------
