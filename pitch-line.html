@@ -38,6 +38,12 @@ canvas{position:absolute;inset:0;width:100%;height:100%;display:block;touch-acti
 .pp{width:68px;height:68px;border-radius:50%;background:var(--song);color:#1b1505;display:grid;place-items:center;flex:none}
 .pp svg{width:28px;height:28px;fill:currentColor}
 .pp:disabled{opacity:.35;cursor:default}
+.result small{color:var(--muted);font-size:13px;letter-spacing:.08em;text-transform:uppercase}
+.pct{font:800 76px/1 Manrope,sans-serif;color:var(--song);font-variant-numeric:tabular-nums}
+.best{font-weight:800;color:var(--fg)}
+.best.new{color:var(--ok)}
+.again{margin-top:6px;padding:14px 26px;border-radius:999px;background:var(--song);color:#1b1505;font-weight:800}
+.live{flex:none;padding:8px 12px;border-radius:999px;background:var(--panel);border:1px solid var(--line);font-weight:800;font-variant-numeric:tabular-nums}
 </style>
 </head>
 <body>
@@ -45,11 +51,13 @@ canvas{position:absolute;inset:0;width:100%;height:100%;display:block;touch-acti
   <div class="top">
     <label class="add">＋ Add media<input type="file" id="file" accept="audio/*,video/*"></label>
     <div class="name" id="name">No song yet</div>
+    <div class="live" id="live" hidden>0%</div>
   </div>
 
   <div class="stage">
     <canvas id="cv"></canvas>
     <div class="msg" id="empty"><b>Add a song or video</b><span>MP3 or MP4. Then press play and sing so the blue line follows the yellow one. Best with headphones.</span></div>
+    <div class="msg result" id="result" hidden><small>Match with the song</small><div class="pct" id="pct">0%</div><span class="best" id="bestT"></span><button class="again" id="again">Sing again</button></div>
     <div class="msg" id="busy" hidden><b id="busyT">Reading the song…</b><div class="bar"><i id="busyB"></i></div></div>
   </div>
 
@@ -86,6 +94,15 @@ function yin(x, off, W, tmin, tmax, thr, d){
   for (let tau = 1; tau <= tmax; tau++){ let s = 0; for (let j = 0; j < W; j++){ const v = x[off+j]-x[off+j+tau]; s += v*v; } run += s; d[tau] = run > 0 ? s*tau/run : 1; }
   let tau = tmin; for (; tau <= tmax; tau++){ if (d[tau] < thr){ while (tau+1 <= tmax && d[tau+1] < d[tau]) tau++; break; } }
   if (tau > tmax) return null;
+  let b = tau; if (tau > 1 && tau < tmax){ const a = d[tau-1], c = d[tau+1], m = d[tau], den = a+c-2*m; if (den) b = tau + (a-c)/(2*den); }
+  return b;
+}
+function yinLow(x, off, W, tmin, tmax, d){
+  let run = 0; d[0] = 1;
+  for (let tau = 1; tau <= tmax; tau++){ let s = 0; for (let j = 0; j < W; j += 2){ const v = x[off+j]-x[off+j+tau]; s += v*v; } run += s; d[tau] = run > 0 ? s*tau/run : 1; }
+  let tau = tmin;
+  for (; tau <= tmax; tau++){ if (d[tau] < 0.2){ while (tau+1 <= tmax && d[tau+1] < d[tau]) tau++; break; } }
+  if (tau > tmax){ let bi = -1, bv = 0.38; for (let k = tmin; k <= tmax; k++) if (d[k] < bv){ bv = d[k]; bi = k; } if (bi < 0) return null; tau = bi; }
   let b = tau; if (tau > 1 && tau < tmax){ const a = d[tau-1], c = d[tau+1], m = d[tau], den = a+c-2*m; if (den) b = tau + (a-c)/(2*den); }
   return b;
 }
@@ -180,7 +197,8 @@ async function load(file){
   if (!b){ $('busy').hidden = true; $('empty').hidden = false; $('empty').querySelector('b').textContent = "That file couldn't be opened"; $('empty').querySelector('span').textContent = 'Try an MP3 or an MP4 video.'; return; }
   buf = b; env = buildEnv(b); ratios = []; floor = 0; const r = await analyze(b); frames = r.f; hop = r.hop; dur = b.duration; setRange();
   trail = []; $('busy').hidden = true;
-  $('name').textContent = file.name.replace(/\.[^.]+$/, '');
+  songName = file.name.replace(/\.[^.]+$/, ''); songKey = 'pitchline-best:' + songName + '|' + Math.round(dur);
+  resetScore(); $('result').hidden = true; showName();
   $('seek').max = dur; $('seek').value = 0; $('tEnd').textContent = fmt(dur); $('pp').disabled = false;
 }
 
@@ -189,24 +207,31 @@ async function startMic(){
   if (micOn) return;
   try{
     const st = await navigator.mediaDevices.getUserMedia({ audio:{ echoCancellation:true, noiseSuppression:false, autoGainControl:false } });
-    analyser = ctx.createAnalyser(); analyser.fftSize = 2048; ctx.createMediaStreamSource(st).connect(analyser); micBuf = new Float32Array(2048); micOn = true;
+    analyser = ctx.createAnalyser(); analyser.fftSize = 4096;
+    const hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 55;
+    const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 1400;
+    ctx.createMediaStreamSource(st).connect(hp); hp.connect(lp); lp.connect(analyser);
+    micBuf = new Float32Array(4096); micOn = true;
   }catch(e){ $('name').textContent = 'Microphone blocked: allow it in the browser'; }
 }
 async function play(){
   if (!buf) return; ensureCtx(); await ctx.resume(); await startMic();
-  if (offsetAt >= dur - 0.1){ offsetAt = 0; trail = []; }
+  if (offsetAt >= dur - 0.1) offsetAt = 0;
+  if (offsetAt < 0.5){ trail = []; resetScore(); }
+  $('result').hidden = true; $('live').hidden = false;
   src = ctx.createBufferSource(); src.buffer = buf; src.connect(gain); src.start(0, offsetAt);
   startedAt = ctx.currentTime - offsetAt; playing = true; $('ppIcon').innerHTML = PAUSE; $('pp').setAttribute('aria-label','Pause');
-  src.onended = () => { if (playing && now() >= dur - 0.15){ offsetAt = dur; playing = false; setIcon(); } };
+  src.onended = () => { if (playing && now() >= dur - 0.15){ offsetAt = dur; playing = false; setIcon(); finish(); } };
 }
 function stop(){ if (playing){ offsetAt = now(); try{ src.onended = null; src.stop(); }catch(e){} } playing = false; setIcon(); }
 function setIcon(){ $('ppIcon').innerHTML = PLAY; $('pp').setAttribute('aria-label','Play'); }
-const micD = new Float32Array(1400);
+const micD = new Float32Array(1200);
 function readMic(){
   if (!micOn) return null;
   analyser.getFloatTimeDomainData(micBuf);
-  let e = 0; for (let i = 0; i < 1024; i++) e += micBuf[i]*micBuf[i];
-  const sr = ctx.sampleRate, micRms = Math.sqrt(e/1024);
+  const MW = 2048, OFF = micBuf.length - MW - 1100; // newest 2048 samples (+ room to compare)
+  let e = 0; for (let i = OFF; i < OFF + MW; i++) e += micBuf[i]*micBuf[i];
+  const sr = ctx.sampleRate, micRms = Math.sqrt(e/MW);
   // Speaker filter: learn how loud the song itself sounds in the mic (the quiet moments when you're not singing),
   // then ignore anything that isn't clearly louder than that. Your voice is close to the mic, the speaker's echo is not.
   let bleed = false;
@@ -217,11 +242,11 @@ function readMic(){
       ratios.push(r); if (ratios.length > 900) ratios.shift();
       if (ratios.length > 60){
         if (!(fc++ % 30)){ const s = ratios.slice().sort((a,b)=>a-b); floor = s[Math.floor(s.length*0.1)]; }
-        if (r < floor * 3) bleed = true;
+        if (r < floor * 2.2) bleed = true;
       }
     }
   }
-  const t = (micRms < 0.012 || bleed) ? null : yin(micBuf, 0, 1024, Math.floor(sr/1100), Math.min(Math.ceil(sr/70), 1023), 0.15, micD);
+  const t = (micRms < 0.006 || bleed) ? null : yinLow(micBuf, OFF, MW, Math.floor(sr/1100), Math.min(Math.ceil(sr/58), 1099), micD);
   if (!t){ // hold the last pitch through short gaps (~120 ms) so the line doesn't break up
     if (++miss > 7){ hist = []; smooth = null; }
     return smooth;
@@ -232,6 +257,22 @@ function readMic(){
   if (smooth === null || Math.abs(m - smooth) > 2.5) smooth = m;   // real jump to a new note: follow at once
   else smooth += (m - smooth) * 0.18;                               // small wobble: glide
   return smooth;
+}
+let songName = '', songKey = '', hitW = 0, tot = 0;
+const pct = () => tot > 0 ? Math.round(100*hitW/tot) : 0;
+function resetScore(){ hitW = 0; tot = 0; $('live').textContent = '0%'; }
+function getBest(){ try{ const v = localStorage.getItem(songKey); return v === null ? null : +v; }catch(e){ return null; } }
+function setBest(v){ try{ localStorage.setItem(songKey, String(v)); }catch(e){} }
+function showName(){ const b = getBest(); $('name').textContent = songName + (b !== null ? ' · Best ' + b + '%' : ''); }
+function finish(){
+  $('live').hidden = true;
+  if (tot < 30){ return; } // too little singing time to score
+  const p = pct(), b = getBest(), isNew = b === null || p > b;
+  $('pct').textContent = p + '%';
+  $('bestT').textContent = isNew ? (b === null ? 'First score saved as your best' : 'New best! (was ' + b + '%)') : 'Your best: ' + b + '%';
+  $('bestT').className = 'best' + (isNew ? ' new' : '');
+  if (isNew) setBest(p);
+  showName(); $('result').hidden = false;
 }
 let miss = 0, smooth = null, octK = null, ratios = [], floor = 0, fc = 0, env = new Float32Array(0);
 const ENV_HOP = 0.02;
@@ -303,6 +344,12 @@ function tick(){
     you = u + 12*(octK || 0);
   }
   if (playing){ trail.push({ t: t - LAT, m: you }); if (trail.length > 30000) trail.splice(0, 10000); }
+  // score: every moment the song has a voice, compare your pitch (full point within ±50 cents, half within ±100)
+  if (playing && micOn){
+    const ref = songAt(t - LAT);
+    if (ref !== null){ tot++; if (you !== null){ const d = Math.abs(you - ref); hitW += d <= 0.5 ? 1 : d <= 1 ? 0.5 : 0; } }
+    $('live').textContent = pct() + '%';
+  }
   if (you !== null && (you < lo + 1 || you > hi - 1) && lastSong === null){ lo = Math.floor(you) - 8; hi = lo + 16; }
   if (playing){ $('seek').value = t; }
   $('tNow').textContent = fmt(t);
@@ -313,6 +360,7 @@ function tick(){
 // ---------- controls ----------
 $('file').addEventListener('change', e => { load(e.target.files[0]); e.target.value = ''; });
 $('pp').onclick = () => playing ? stop() : play();
+$('again').onclick = () => { offsetAt = 0; play(); };
 $('seek').addEventListener('input', e => { const was = playing; stop(); offsetAt = +e.target.value; trail = trail.filter(p => p.t < offsetAt); if (was) play(); });
 document.addEventListener('dragover', e => e.preventDefault());
 document.addEventListener('drop', e => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) load(f); });
