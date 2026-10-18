@@ -38,6 +38,7 @@ canvas{position:absolute;inset:0;width:100%;height:100%;display:block;touch-acti
 .pp{width:68px;height:68px;border-radius:50%;background:var(--song);color:#1b1505;display:grid;place-items:center;flex:none}
 .pp svg{width:28px;height:28px;fill:currentColor}
 .pp:disabled{opacity:.35;cursor:default}
+.chip{flex:none;padding:8px 12px;border-radius:999px;background:var(--panel);border:1px solid var(--line);font-weight:800;font-size:13px;color:var(--muted);white-space:nowrap}
 .speed{flex:none;min-width:56px;padding:10px 12px;border-radius:999px;background:var(--panel);border:1px solid var(--line);font-weight:800;font-variant-numeric:tabular-nums}
 .result small{color:var(--muted);font-size:13px;letter-spacing:.08em;text-transform:uppercase}
 .pct{font:800 76px/1 Manrope,sans-serif;color:var(--song);font-variant-numeric:tabular-nums}
@@ -52,6 +53,7 @@ canvas{position:absolute;inset:0;width:100%;height:100%;display:block;touch-acti
   <div class="top">
     <label class="add">＋ Add media<input type="file" id="file" accept="audio/*,video/*"></label>
     <div class="name" id="name">No song yet</div>
+    <button class="chip" id="mic" hidden aria-label="Switch microphone">🎤 Mic</button>
     <div class="live" id="live" hidden>0%</div>
   </div>
 
@@ -279,7 +281,7 @@ async function load(file){
   if (!b && isVideo){ try{ b = await extractViaPlayer(file); playable = wavBlob(b); }catch(e){} } // 3) last resort
   if (!b){ $('busy').hidden = true; $('empty').hidden = false; $('empty').querySelector('b').textContent = "That file couldn't be opened"; $('empty').querySelector('span').textContent = "Couldn't read the sound in this file. Try another MP4 or an MP3."; return; }
   if (mediaUrl) URL.revokeObjectURL(mediaUrl); mediaUrl = URL.createObjectURL(playable); audio.src = mediaUrl; audio.load();
-  buf = b; env = buildEnv(b); ratios = []; floor = 0; const r = await analyze(b); frames = r.f; hop = r.hop; dur = b.duration; setRange();
+  buf = b; songSR = b.sampleRate; songMono = new Float32Array(b.length); for (let c = 0; c < b.numberOfChannels; c++){ const d = b.getChannelData(c); for (let i = 0; i < d.length; i++) songMono[i] += d[i]/b.numberOfChannels; } sbReset(); sbResetLag(); const r = await analyze(b); frames = r.f; hop = r.hop; dur = b.duration; setRange();
   trail = []; $('busy').hidden = true;
   songName = file.name.replace(/\.[^.]+$/, ''); songKey = 'pitchline-best:' + songName + '|' + Math.round(dur);
   resetScore(); $('result').hidden = true; showName();
@@ -287,16 +289,44 @@ async function load(file){
 }
 
 // ---------- transport + mic ----------
+let micStream = null, micSource = null, micList = [], micIdx = -1;
+const isBuiltIn = d => /iphone|built-?in|internal|phone microphone|default/i.test(d.label) && !/airpod|bluetooth|headset|earpod|hands-?free|buds|wireless/i.test(d.label);
+async function openMic(deviceId){
+  const st = await navigator.mediaDevices.getUserMedia({ audio: Object.assign({ echoCancellation: true, noiseSuppression: false, autoGainControl: false }, deviceId ? { deviceId: { exact: deviceId } } : {}) });
+  if (micStream) micStream.getTracks().forEach(t => t.stop());
+  if (micSource) micSource.disconnect();
+  micStream = st;
+  if (!analyser){
+    analyser = ctx.createAnalyser(); analyser.fftSize = 4096;
+    const hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 55;
+    const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 1600;
+    hp.connect(lp); lp.connect(analyser); analyser._in = hp;
+    micBuf = new Float32Array(4096); sbInit(ctx.sampleRate);
+  }
+  micSource = ctx.createMediaStreamSource(st); micSource.connect(analyser._in);
+  micOn = true; hist = []; smooth = null;
+  const track = st.getAudioTracks()[0]; const lbl = (track && track.label) || 'Microphone';
+  $('mic').textContent = '🎤 ' + shortMic(lbl); $('mic').hidden = false;
+}
+const shortMic = l => /iphone|built-?in|internal/i.test(l) ? 'Phone mic' : /airpod/i.test(l) ? 'AirPods mic' : /earpod|headset|wired/i.test(l) ? 'Earbuds mic' : l.length > 16 ? l.slice(0, 15) + '…' : l;
 async function startMic(){
   if (micOn) return;
   try{
-    const st = await navigator.mediaDevices.getUserMedia({ audio:{ echoCancellation:true, noiseSuppression:false, autoGainControl:false } });
-    analyser = ctx.createAnalyser(); analyser.fftSize = 4096;
-    const hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 55;
-    const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 1400;
-    ctx.createMediaStreamSource(st).connect(hp); hp.connect(lp); lp.connect(analyser);
-    micBuf = new Float32Array(4096); micOn = true;
+    await openMic(null);
+    micList = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'audioinput' && d.deviceId);
+    const cur = micStream.getAudioTracks()[0].getSettings().deviceId;
+    const builtIn = micList.find(isBuiltIn);
+    if (builtIn && builtIn.deviceId !== cur){ try{ await openMic(builtIn.deviceId); }catch(e){} } // earbuds in: still listen with the phone's mic
+    const now_ = micStream.getAudioTracks()[0].getSettings().deviceId;
+    micIdx = micList.findIndex(d => d.deviceId === now_);
   }catch(e){ $('name').textContent = 'Microphone blocked: allow it in the browser'; }
+}
+async function nextMic(){
+  if (!micOn){ ensureCtx(); await ctx.resume(); return startMic(); }
+  micList = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'audioinput' && d.deviceId);
+  if (micList.length < 2){ $('mic').textContent = '🎤 Only one mic'; setTimeout(() => { const t = micStream && micStream.getAudioTracks()[0]; $('mic').textContent = '🎤 ' + shortMic((t && t.label) || 'Microphone'); }, 1500); return; }
+  micIdx = (micIdx + 1) % micList.length;
+  try{ await openMic(micList[micIdx].deviceId); }catch(e){}
 }
 async function play(){
   if (!buf) return; ensureCtx(); await ctx.resume(); await startMic();
@@ -311,27 +341,125 @@ audio.addEventListener('ended', () => { playing = false; setIcon(); finish(); })
 function stop(){ audio.pause(); playing = false; setIcon(); }
 function setIcon(){ $('ppIcon').innerHTML = PLAY; $('pp').setAttribute('aria-label','Play'); }
 const micD = new Float32Array(1200);
-function readMic(){
-  if (!micOn) return null;
-  analyser.getFloatTimeDomainData(micBuf);
-  const MW = 2048, OFF = micBuf.length - MW - 1100; // newest 2048 samples (+ room to compare)
-  let e = 0; for (let i = OFF; i < OFF + MW; i++) e += micBuf[i]*micBuf[i];
-  const sr = ctx.sampleRate, micRms = Math.sqrt(e/MW);
-  // Speaker filter: learn how loud the song itself sounds in the mic (the quiet moments when you're not singing),
-  // then ignore anything that isn't clearly louder than that. Your voice is close to the mic, the speaker's echo is not.
-  let bleed = false;
-  if (playing){
-    const lvl = songLevel(now()) * audio.volume;
-    if (lvl > 0.01){
-      const r = micRms / lvl;
-      ratios.push(r); if (ratios.length > 900) ratios.shift();
-      if (ratios.length > 60){
-        if (!(fc++ % 30)){ const s = ratios.slice().sort((a,b)=>a-b); floor = s[Math.floor(s.length*0.1)]; }
-        if (r < floor * 2.2) bleed = true;
+// ===== Song-removal for the mic (known-reference spectral subtraction) =====
+const DN = 4096;
+const HANN = new Float32Array(DN); for (let i = 0; i < DN; i++) HANN[i] = 0.5 - 0.5*Math.cos(2*Math.PI*i/(DN-1));
+function fft(re, im, inv){
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++){ let b = n >> 1; for (; j & b; b >>= 1) j ^= b; j ^= b; if (i < j){ let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; } }
+  for (let len = 2; len <= n; len <<= 1){
+    const ang = (inv ? 2 : -2)*Math.PI/len, wr = Math.cos(ang), wi = Math.sin(ang);
+    for (let i = 0; i < n; i += len){
+      let cr = 1, ci = 0;
+      for (let k = 0; k < len/2; k++){
+        const a = i+k, b = a+len/2, xr = re[b]*cr - im[b]*ci, xi = re[b]*ci + im[b]*cr;
+        re[b] = re[a]-xr; im[b] = im[a]-xi; re[a] += xr; im[a] += xi;
+        const nr = cr*wr - ci*wi; ci = cr*wi + ci*wr; cr = nr;
       }
     }
   }
-  const t = (micRms < 0.006 || bleed) ? null : yinLow(micBuf, OFF, MW, Math.floor(sr/1100), Math.min(Math.ceil(sr/58), 1099), micD);
+  if (inv) for (let i = 0; i < n; i++){ re[i] /= n; im[i] /= n; }
+}
+const SB = { // state
+  mr: new Float32Array(DN), mi: new Float32Array(DN), sr_: new Float32Array(DN), si: new Float32Array(DN),
+  M: new Float32Array(DN/2), S: new Float32Array(DN/2), Sprev: new Float32Array(DN/2), Sm: new Float32Array(DN/2),
+  out: new Float32Array(DN), bands: null, hist: null, H: null, hp: 0, frame: 0,
+  lag: 0.12, lagHist: [], cleanRatio: 1
+};
+function sbInit(ctxSR){
+  // ~1/3-octave bands 60 Hz .. 1.6 kHz
+  const edges = []; for (let f = 60; f < 1700; f *= 1.26) edges.push(Math.round(f*DN/ctxSR));
+  SB.bands = []; for (let i = 0; i < edges.length-1; i++) SB.bands.push([Math.max(1, edges[i]), Math.max(edges[i]+1, edges[i+1])]);
+  SB.hist = SB.bands.map(() => new Float32Array(600).fill(NaN)); SB.H = new Float32Array(SB.bands.length); SB.hp = 0; SB.frame = 0;
+  SB.lagHist = []; SB.lag = 0.12;
+}
+function sbReset(){ if (SB.hist){ SB.hist.forEach(h => h.fill(NaN)); SB.H.fill(0); SB.Sprev.fill(0); SB.lagHist = []; } }
+// mic: newest DN samples (Float32Array, ctx rate); song: mono Float32Array at songSR; tSong: song time playing now; rate: speed
+// returns cleaned time signal (Hann-windowed) in SB.out, and SB.cleanRatio (energy kept)
+function sbClean(mic, ctxSR, song, songSR, tSong, rate){
+  const {mr, mi, sr_, si, M, S, Sprev, Sm, bands, hist, H} = SB;
+  for (let i = 0; i < DN; i++){ mr[i] = mic[i]*HANN[i]; mi[i] = 0; }
+  fft(mr, mi, false);
+  for (let k = 0; k < DN/2; k++) M[k] = Math.hypot(mr[k], mi[k]);
+  // song window the mic is hearing now (centre of mic window = now - DN/2 real samples, minus speaker->mic lag)
+  const centre = tSong - (SB.lag + DN/2/ctxSR)*rate;
+  const c0 = Math.round(centre*songSR) - DN/2;
+  for (let i = 0; i < DN; i++){ const j = c0 + i; sr_[i] = (j >= 0 && j < song.length ? song[j] : 0)*HANN[i]; si[i] = 0; }
+  fft(sr_, si, false);
+  const fr = songSR/ctxSR; // mic bin k <-> song bin k/fr
+  for (let k = 0; k < DN/2; k++){ const j = Math.round(k/fr); S[k] = j < DN/2 ? Math.hypot(sr_[j], si[j]) : 0; }
+  // smear: max over +-2 bins and previous frame (covers timing / tuning slop)
+  for (let k = 0; k < DN/2; k++){ let m = Sprev[k]; for (let d = -2; d <= 2; d++){ const v = S[k+d]; if (v > m) m = v; } Sm[k] = m; }
+  Sprev.set(S);
+  // learn the speaker->mic level per band: 20th percentile of mic/song over the last ~10 s
+  // (breaths and pauses give song-only moments, so this lands on the speaker level, not your voice)
+  let songE = 0, maxSe = 0; const se_ = [];
+  for (let b = 0; b < bands.length; b++){ let se = 0; for (let k = bands[b][0]; k < bands[b][1]; k++) se += S[k]*S[k]; se_.push(se); songE += se; if (se > maxSe) maxSe = se; }
+  for (let b = 0; b < bands.length; b++){
+    if (se_[b] < maxSe*0.01 || se_[b] < 1e-4){ hist[b][SB.hp] = NaN; continue; }
+    let me = 0; for (let k = bands[b][0]; k < bands[b][1]; k++) me += M[k]*M[k];
+    hist[b][SB.hp] = Math.sqrt(me/se_[b]);
+  }
+  SB.hp = (SB.hp + 1) % hist[0].length;
+  if (SB.frame++ % 15 === 0){
+    for (let b = 0; b < bands.length; b++){
+      const v = Array.from(hist[b]).filter(x => x === x).sort((p,q) => p-q);
+      if (v.length >= 20) H[b] = v[Math.floor(v.length*0.2)];
+    }
+  }
+  // subtract (2x over-subtraction) and rebuild the cleaned signal
+  let eIn = 0, eOut = 0;
+  for (let b = 0; b < bands.length; b++){
+    const g = 2*H[b];
+    for (let k = bands[b][0]; k < bands[b][1]; k++){
+      const m = M[k], r = Math.max(0, m - g*Sm[k]), mask = m > 0 ? r/m : 0;
+      eIn += m*m; eOut += r*r;
+      mr[k] *= mask; mi[k] *= mask; mr[DN-k] = mr[k]; mi[DN-k] = -mi[k];
+    }
+  }
+  for (let k = 0; k < bands[0][0]; k++){ mr[k] = mi[k] = 0; if (k > 0){ mr[DN-k] = mi[DN-k] = 0; } }
+  const top = bands[bands.length-1][1]; for (let k = top; k <= DN/2; k++){ mr[k] = mi[k] = 0; if (k > 0 && k < DN) { mr[DN-k] = 0; mi[DN-k] = 0; } }
+  fft(mr, mi, true);
+  for (let i = 0; i < DN; i++) SB.out[i] = mr[i]/Math.max(HANN[i], 0.1); // undo the window so pitch tracking sees a flat signal
+  SB.cleanRatio = eIn > 0 ? eOut/eIn : 1;
+  return songE;
+}
+// speaker->mic delay: every half second, test delays 0..400 ms and keep the one whose song spectrum best matches the mic
+const LAGS = []; for (let L = 0.0; L <= 0.401; L += 0.025) LAGS.push(L);
+const lagScore = new Float32Array(LAGS.length);
+function sbTrackLag(mic, ctxSR, song, songSR, tSong, rate){
+  if (SB.frame % 30) return;
+  const {mr, mi, sr_, si, M} = SB, fr = songSR/ctxSR, k0 = SB.bands[0][0], k1 = SB.bands[SB.bands.length-1][1];
+  for (let i = 0; i < DN; i++){ mr[i] = mic[i]*HANN[i]; mi[i] = 0; } fft(mr, mi, false);
+  let mm = 0; for (let k = k0; k < k1; k++){ M[k] = Math.hypot(mr[k], mi[k]); mm += M[k]*M[k]; }
+  if (mm < 1e-6) return;
+  for (let li = 0; li < LAGS.length; li++){
+    const c0 = Math.round((tSong - (LAGS[li] + DN/2/ctxSR)*rate)*songSR) - DN/2;
+    for (let i = 0; i < DN; i++){ const j = c0 + i; sr_[i] = (j >= 0 && j < song.length ? song[j] : 0)*HANN[i]; si[i] = 0; }
+    fft(sr_, si, false);
+    let dot = 0, ss = 0;
+    for (let k = k0; k < k1; k++){ const j = Math.round(k/fr); const v = Math.hypot(sr_[j], si[j]); dot += v*M[k]; ss += v*v; }
+    lagScore[li] = lagScore[li]*0.9 + (ss > 0 ? dot/Math.sqrt(ss*mm) : 0);
+  }
+  let bi = 0; for (let li = 1; li < LAGS.length; li++) if (lagScore[li] > lagScore[bi]) bi = li;
+  SB.lag = LAGS[bi];
+}
+function sbResetLag(){ lagScore.fill(0); }
+
+let songMono = null, songSR = 44100;
+function readMic(){
+  if (!micOn) return null;
+  analyser.getFloatTimeDomainData(micBuf);
+  const sr = ctx.sampleRate, MW = 2048, OFF = 474;
+  let x = micBuf, keep = 1;
+  if (playing && songMono){ // take the song (coming from the phone speaker) out of what the mic hears
+    sbTrackLag(micBuf, sr, songMono, songSR, now(), rate);
+    sbClean(micBuf, sr, songMono, songSR, now(), rate);
+    x = SB.out; keep = SB.cleanRatio;
+  }
+  let e = 0; for (let i = OFF; i < OFF + MW; i++) e += x[i]*x[i];
+  const rms = Math.sqrt(e/MW);
+  const t = (rms < 0.0025 || keep < 0.1) ? null : yinLow(x, OFF, MW, Math.floor(sr/1100), Math.min(Math.ceil(sr/58), 1099), micD);
   if (!t){ // hold the last pitch through short gaps (~120 ms) so the line doesn't break up
     if (++miss > 7){ hist = []; smooth = null; }
     return smooth;
@@ -449,6 +577,7 @@ function tick(){
 // ---------- controls ----------
 $('file').addEventListener('change', e => { load(e.target.files[0]); e.target.value = ''; });
 $('pp').onclick = () => playing ? stop() : play();
+$('mic').onclick = nextMic;
 $('again').onclick = () => { audio.currentTime = 0; play(); };
 $('seek').addEventListener('input', e => { const v = +e.target.value; audio.currentTime = v; trail = trail.filter(p => p.t < v); });
 const SPEEDS = [1, 0.75, 0.5];
